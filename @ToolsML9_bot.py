@@ -3,8 +3,8 @@
 """
 MLBB BOT — Telegram Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. ⚡ FAST BULK  — sort skin, skip banned, output TXT+JSON
-2. 🔁 BF LOOP    — UNLIMITED, batre bar (console), NO EDIT PESAN
+1. ⚡ FAST BULK  — silent background, output TXT ramping
+2. 🔁 BF LOOP    — UNLIMITED, silent background
 """
 
 import os, sys, time, socket, struct, zlib, random, uuid, logging
@@ -49,7 +49,7 @@ BF_FAIL_FILE  = os.path.join(OUTPUT_DIR, "bf_fails.txt")
 
 MAX_BF_DEVICES   = 999_999
 MAX_BULK_DEVICES = 999_999
-BULK_THREADS     = 16
+BULK_THREADS     = 40          # dinaikin biar cepet
 BF_THREADS       = 20
 
 BANNED_KEYWORDS = [
@@ -805,8 +805,9 @@ def save_log(filepath, line):
 bf_stop_flags   = {}
 bulk_stop_flags = {}
 bf_tasks        = {}
+bulk_tasks      = {}
 
-(MENU, IN_BF, IN_BULK, BULK_RUN) = range(4)
+(MENU, IN_BF, IN_BULK) = range(3)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -816,13 +817,9 @@ def kb_main():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚡ FAST BULK", callback_data="d_bulk"),
          InlineKeyboardButton("🔁 BF LOOP",   callback_data="d_bf")],
-        [InlineKeyboardButton("🛑 STOP BF",   callback_data="stop_bf")],
+        [InlineKeyboardButton("🛑 STOP BF",   callback_data="stop_bf"),
+         InlineKeyboardButton("🛑 STOP BULK", callback_data="stop_bulk")],
         [InlineKeyboardButton("❌ Tutup",     callback_data="m_close")],
-    ])
-
-def kb_stop_bulk():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛑 STOP BULK", callback_data="stop_bulk")]
     ])
 
 def kb_join():
@@ -891,6 +888,16 @@ async def cmd_stopbf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Tidak ada BF Loop berjalan.")
 
 
+async def cmd_stopbulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ev = bulk_stop_flags.get(uid)
+    if ev:
+        ev.set()
+        await update.message.reply_text("🛑 Bulk dihentikan.")
+    else:
+        await update.message.reply_text("❌ Tidak ada Bulk berjalan.")
+
+
 # ══════════════════════════════════════════════════════════════════════
 # MENU ROUTER
 # ══════════════════════════════════════════════════════════════════════
@@ -930,8 +937,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚡ *FAST BULK*\n\n"
             "Kirim / upload file `.txt` berisi Device ID.\n\n"
             "• Sort: *skin terbanyak* di atas\n"
-            "• 🚫 Akun *banned* otomatis di-buang\n"
-            "• Output: `.txt` + `.json`",
+            "• 🚫 Akun *banned* / invalid otomatis di-buang\n"
+            "• 📁 Output: `.txt` ringkas\n"
+            "• 🔇 Jalan di background, hasil dikirim setelah selesai",
             parse_mode="Markdown")
         return IN_BULK
 
@@ -949,8 +957,12 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "stop_bulk":
         ev = bulk_stop_flags.get(uid)
-        if ev: ev.set()
-        await q.message.edit_text("🛑 Stop BULK...", reply_markup=kb_main())
+        if ev:
+            ev.set()
+            bulk_tasks.pop(uid, None)
+            await q.message.edit_text("🛑 Bulk dihentikan.", reply_markup=kb_main())
+        else:
+            await q.answer("Tidak ada Bulk berjalan.", show_alert=True)
         return MENU
 
     if data == "stop_bf":
@@ -985,7 +997,7 @@ async def input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ⚡ FAST BULK
+# ⚡ FAST BULK — SILENT BACKGROUND
 # ══════════════════════════════════════════════════════════════════════
 async def bulk_input(update, context):
     uid = update.effective_user.id
@@ -1006,24 +1018,52 @@ async def bulk_input(update, context):
                                         reply_markup=kb_main())
         return MENU
 
+    # Hentikan bulk lama kalau ada
+    old = bulk_tasks.get(uid)
+    if old:
+        old_ev = bulk_stop_flags.get(uid)
+        if old_ev:
+            old_ev.set()
+        old_task = old.get("task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        bulk_tasks.pop(uid, None)
+
     ev = threading.Event()
     bulk_stop_flags[uid] = ev
 
-    msg = await update.message.reply_text(
-        f"⚡ *FAST BULK* — {len(devs)} device\n⏳ Mulai scan...",
-        parse_mode="Markdown", reply_markup=kb_stop_bulk())
-    asyncio.create_task(_run_bulk(uid, msg, devs, ev))
-    return BULK_RUN
+    # 1 pesan konfirmasi — TIDAK DIEDIT LAGI
+    await update.message.reply_text(
+        f"⚡ *FAST BULK DIMULAI*\n\n"
+        f"📱 Total device : `{len(devs)}`\n"
+        f"⚙️ Threads      : `{BULK_THREADS}`\n"
+        f"🔇 Mode         : Silent background\n"
+        f"📁 Output       : `.txt` ringkas (valid 100%)\n\n"
+        f"🛑 Stop: tombol *STOP BULK* atau `/stopbulk`\n\n"
+        f"⏳ Hasil dikirim otomatis setelah selesai...",
+        parse_mode="Markdown",
+        reply_markup=kb_main()
+    )
+
+    task = asyncio.create_task(_bulk_worker(uid, update.effective_chat.id, devs, ev))
+    bulk_tasks[uid] = {"task": task, "started": time.time(), "device_count": len(devs)}
+    return MENU
 
 
-async def _run_bulk(uid, msg, devs, ev):
-    total  = len(devs)
-    done   = 0
-    succ   = []
+async def _bulk_worker(uid, chat_id, devs, ev):
+    """
+    Worker bulk — murni background.
+    TIDAK edit_message_text. Hasil dikirim via sendDocument setelah selesai.
+    Valid 100%: harus punya skin_count > 0 DAN hero_count > 0 DAN level > 0.
+    """
+    total = len(devs)
+    done = 0
+    succ = []
     banned = 0
-    fail   = 0
-    start  = time.time()
-    last_edit = 0
+    fail = 0
+    start = time.time()
+
+    logger.info(f"[BULK] START uid={uid} device={total}")
 
     with ThreadPoolExecutor(max_workers=BULK_THREADS) as pool:
         futs = {pool.submit(scan_account_detail, d): d for d in devs}
@@ -1039,130 +1079,101 @@ async def _run_bulk(uid, msg, devs, ev):
 
             done += 1
 
+            # ── Validasi ketat: harus valid 100% ──
             if r.get("banned") or r.get("status") == "banned":
                 banned += 1
             elif r.get("status") == "success":
-                if r.get("skin_count", 0) == 0 and r.get("hero_count", 0) == 0:
-                    banned += 1
-                elif r.get("level", 0) <= 0:
-                    banned += 1
-                else:
+                lv = r.get("level", 0)
+                sc = r.get("skin_count", 0)
+                hc = r.get("hero_count", 0)
+                pid = r.get("player_id")
+
+                # Wajib: player_id valid, level > 0, skin > 0, hero > 0
+                if (pid and isinstance(pid, (int, str)) and str(pid).isdigit()
+                        and isinstance(lv, int) and lv > 0
+                        and isinstance(sc, int) and sc > 0
+                        and isinstance(hc, int) and hc > 0):
                     succ.append(r)
+                else:
+                    banned += 1  # invalid / banned → buang
             else:
                 fail += 1
 
-            now = time.time()
-            if now - last_edit >= 2.5 or done == total:
-                last_edit = now
-                pct = done * 100 // total
-                bar = battery_bar(pct, 20)
-                elapsed = now - start
-                eta = (elapsed / done) * (total - done) if done else 0
-                try:
-                    await msg.edit_text(
-                        f"⚡ *FAST BULK* {done}/{total} ({pct}%)\n"
-                        f"`{bar}`\n"
-                        f"✅ Hit: {len(succ)} | 🚫 Banned: {banned} | ❌ Fail: {fail}\n"
-                        f"⏱ ETA: {format_uptime(eta)}",
-                        parse_mode="Markdown",
-                        reply_markup=kb_stop_bulk())
-                except Exception:
-                    pass
+            if done % 25 == 0 or done == total:
+                elapsed = time.time() - start
+                rpm = int(done * 60 / elapsed) if elapsed > 0 else 0
+                logger.info(
+                    f"[BULK] uid={uid} {done}/{total} | "
+                    f"hit={len(succ)} banned={banned} fail={fail} | rpm={rpm}"
+                )
 
     bulk_stop_flags.pop(uid, None)
+    bulk_tasks.pop(uid, None)
 
+    # ── Sort skin DESC ──
     succ.sort(key=lambda x: x.get("skin_count", 0), reverse=True)
 
+    # ── Tulis file TXT ramping ──
     ts = int(time.time())
-    fname_txt  = f"BULK_{ts}.txt"
-    fname_json = f"BULK_{ts}.json"
-    fpath_txt  = os.path.join(OUTPUT_DIR, fname_txt)
-    fpath_json = os.path.join(OUTPUT_DIR, fname_json)
+    fname_txt = f"BULK_{ts}.txt"
+    fpath_txt = os.path.join(OUTPUT_DIR, fname_txt)
 
     with open(fpath_txt, "w", encoding="utf-8") as f:
-        f.write("=" * 60 + "\n")
-        f.write("FAST BULK RESULT — MLBB\n")
-        f.write("=" * 60 + "\n\n")
-        f.write(f"Generated : {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n")
-        f.write(f"Total     : {total}\n")
-        f.write(f"Hit       : {len(succ)}\n")
-        f.write(f"Banned    : {banned} (dibuang)\n")
-        f.write(f"Fail      : {fail}\n")
-        f.write(f"Sort      : skin_count DESC\n\n")
-
+        f.write("=" * 49 + "\n")
         for i, r in enumerate(succ, 1):
-            f.write(f"[{i}] {r.get('nickname','-')}\n")
-            f.write(f"    Device ID  : {r.get('device_id','-')}\n")
-            f.write(f"    ID Akun    : {r.get('player_id','-')}\n")
-            f.write(f"    Zone ID    : {r.get('server','-')}\n")
-            f.write(f"    Skin Count : {r.get('skin_count', 0)}\n")
-            f.write(f"    Hero Count : {r.get('hero_count', 0)}\n")
-            f.write(f"    Level      : {r.get('level', 0)}\n")
-            f.write(f"    Rank       : {r.get('rank','-')}\n")
-            f.write(f"    High Rank  : {r.get('high_rank','-')}\n")
-            f.write(f"    Matches    : {r.get('matches', 0)}\n\n")
+            f.write(
+                f"{i}. Device id: {r.get('device_id','-')} "
+                f"| player_id: {r.get('player_id','-')}\n"
+                f"   level      : {r.get('level', 0)}\n"
+                f"   skin_count : {r.get('skin_count', 0)}\n"
+                f"   hero_count : {r.get('hero_count', 0)}\n\n"
+            )
 
-    with open(fpath_json, "w", encoding="utf-8") as f:
-        json.dump({
-            "generated_at": datetime.datetime.now().isoformat(),
-            "total_scan":   total,
-            "hit":          len(succ),
-            "banned":       banned,
-            "fail":         fail,
-            "sorted_by":    "skin_count_desc",
-            "results": [
-                {
-                    "device_id":  r.get("device_id"),
-                    "player_id":  r.get("player_id"),
-                    "zone_id":    r.get("server"),
-                    "nickname":   r.get("nickname"),
-                    "skin_count": r.get("skin_count"),
-                    "hero_count": r.get("hero_count"),
-                    "level":      r.get("level"),
-                    "rank":       r.get("rank"),
-                    "high_rank":  r.get("high_rank"),
-                    "matches":    r.get("matches"),
-                } for r in succ
-            ],
-        }, f, indent=2, ensure_ascii=False)
+    logger.info(
+        f"[BULK] 🏁 DONE uid={uid} | total={total} | hit={len(succ)} "
+        f"banned/invalid={banned} fail={fail} | file={fpath_txt}"
+    )
 
+    # ── Kirim file ke user ──
+    elapsed = time.time() - start
     caption = (
         f"⚡ *FAST BULK SELESAI*\n\n"
-        f"📊 Scan     : {total}\n"
-        f"✅ Hit      : {len(succ)}\n"
-        f"🚫 Banned   : {banned} (dibuang)\n"
-        f"❌ Fail     : {fail}\n"
-        f"🏆 Top skin : {succ[0]['skin_count'] if succ else 0}\n"
-        f"📁 File     : TXT + JSON"
+        f"📊 Scan       : {total}\n"
+        f"✅ Hit valid  : {len(succ)}\n"
+        f"🚫 Banned/Inv : {banned}\n"
+        f"❌ Fail       : {fail}\n"
+        f"⏱ Runtime    : {format_uptime(elapsed)}"
     )
 
     try:
         with open(fpath_txt, "rb") as f:
-            await msg.reply_document(document=f, filename=fname_txt,
-                                     caption=caption, parse_mode="Markdown")
-    except Exception:
-        pass
+            await _send_doc(chat_id, f, fname_txt, caption)
+    except Exception as e:
+        logger.exception(f"[BULK] gagal kirim file: {e}")
 
+
+async def _send_doc(chat_id, fileobj, filename, caption):
+    """Helper kirim document via bot instance global."""
+    global _APP
     try:
-        with open(fpath_json, "rb") as f:
-            await msg.reply_document(document=f, filename=fname_json)
-    except Exception:
-        pass
+        await _APP.bot.send_document(
+            chat_id=chat_id,
+            document=fileobj,
+            filename=filename,
+            caption=caption,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.exception(f"send_doc err: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 🔁 BF LOOP — TANPA EDIT PESAN (BACKGROUND ONLY)
+# 🔁 BF LOOP — SILENT BACKGROUND
 # ══════════════════════════════════════════════════════════════════════
 async def bf_input(update, context):
-    """
-    User kirim device ID → langsung eksekusi.
-    Bot kirim 1 pesan konfirmasi, lalu loop jalan di background.
-    TIDAK ada edit pesan lagi.
-    """
     uid = update.effective_user.id
     devs = extract_device_ids_from_text(update.message.text or "")
 
-    # Kalau user upload file .txt
     if update.message.document:
         try:
             f = await update.message.document.get_file()
@@ -1179,7 +1190,6 @@ async def bf_input(update, context):
             parse_mode="Markdown", reply_markup=kb_main())
         return MENU
 
-    # Hentikan BF loop lama user ini kalau ada
     old = bf_tasks.get(uid)
     if old:
         old_ev = bf_stop_flags.get(uid)
@@ -1190,12 +1200,10 @@ async def bf_input(update, context):
             old_task.cancel()
         bf_tasks.pop(uid, None)
 
-    # Event baru
     ev = threading.Event()
     bf_stop_flags[uid] = ev
 
-    # ── Kirim 1 pesan konfirmasi (tidak diedit lagi) ──
-    confirm = await update.message.reply_text(
+    await update.message.reply_text(
         f"✅ *BF LOOP DIMULAI*\n\n"
         f"📱 Total device : `{len(devs)}`\n"
         f"♾️ Mode         : Unlimited loop\n"
@@ -1207,7 +1215,6 @@ async def bf_input(update, context):
         reply_markup=kb_main()
     )
 
-    # ── Spawn background task ──
     task = asyncio.create_task(_bf_worker(uid, devs, ev))
     bf_tasks[uid] = {"task": task, "started": time.time(), "device_count": len(devs)}
 
@@ -1215,11 +1222,6 @@ async def bf_input(update, context):
 
 
 async def _bf_worker(uid, devs, ev):
-    """
-    Worker BF loop — murni background.
-    TIDAK ada edit_message_text / reply lagi.
-    Hit / kick / fail → tulis ke file + log console.
-    """
     loop_count = 0
     hits = 0
     kicks = 0
@@ -1277,7 +1279,6 @@ async def _bf_worker(uid, devs, ev):
                                 f"| loop={loop_count}")
                         save_log(BF_FAIL_FILE, line)
 
-                    # Progress ke console setiap 10 device
                     if device_idx % 10 == 0:
                         elapsed = time.time() - start
                         rpm = int(scanned * 60 / elapsed) if elapsed > 0 else 0
@@ -1316,7 +1317,11 @@ async def _bf_worker(uid, devs, ev):
 # ══════════════════════════════════════════════════════════════════════
 # POST INIT & MAIN
 # ══════════════════════════════════════════════════════════════════════
+_APP = None
+
 async def post_init(app: Application):
+    global _APP
+    _APP = app
     print("🔄 Delete webhook...")
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -1365,10 +1370,6 @@ def main():
                 MessageHandler(filters.Document.ALL, input_handler),
                 CallbackQueryHandler(menu_router),
             ],
-            BULK_RUN: [
-                CallbackQueryHandler(menu_router,
-                                     pattern="^(stop_bulk|m_close|m_home)$"),
-            ],
         },
         fallbacks=[
             CommandHandler("start", cmd_start),
@@ -1380,6 +1381,7 @@ def main():
 
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("stopbf", cmd_stopbf))
+    app.add_handler(CommandHandler("stopbulk", cmd_stopbulk))
     app.add_handler(conv)
 
     print("✅ Bot running...")
